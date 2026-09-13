@@ -1,222 +1,28 @@
-{ lib, config, pkgs, ... }:
+{ pkgs, ... }:
 
-let
-  cfg = config.obsidian;
+# Development environment for this repository itself.
+#
+# This is intentionally separate from the module consumers import. That module
+# lives in nix/modules/obsidian.nix and is exposed as the `devenvModules.default`
+# flake output; nothing here is part of its public interface.
+{
+  # Importing the module keeps it evaluated on every shell entry (it defines
+  # options only, and `obsidian.enable` defaults to false, so no tasks run).
+  imports = [ ./nix/modules/obsidian.nix ];
 
-  mkPlugin = pkgs.callPackage ./lib/mk-obsidian-plugin.nix { };
-  cli = pkgs.callPackage ./lib/obsidian-cli.nix { };
+  # The CLI in cli/ is written in Go.
+  languages.go.enable = true;
 
-  lockPath = "${config.devenv.root}/${cfg.lockFile}";
-  lock =
-    let
-      raw = if builtins.pathExists lockPath then builtins.readFile lockPath else "";
-    in
-    if raw == "" then { } else builtins.fromJSON raw;
+  packages = with pkgs; [
+    git
+    nixfmt
+  ];
 
-  # A lock entry is usable while it still matches whatever the declaration
-  # pins. An id-only declaration pins nothing, so any entry for that id counts;
-  # `obsidian:sync` is what turns one into the other.
-  lockEntry =
-    name: p:
-    let
-      entry = lock.${name} or null;
-    in
-    if entry == null then
-      null
-    else if p.repo != null && entry.repo != p.repo then
-      null
-    else if p.version != null && entry.version != p.version then
-      null
-    else
-      entry;
-
-  # A plugin is identified by a prebuilt derivation (`pkg`), or by a release
-  # resolved from the lock file. A release in turn comes from an explicit
-  # `repo`, or from the community registry by id. Returns null while unsynced,
-  # so the shell stays evaluable and `obsidian:sync` can run.
-  pluginPath =
-    name: p:
-    if p.pkg != null then
-      if p.repo != null || p.version != null then
-        throw "obsidian.plugins.${name}: `pkg` cannot be combined with `repo`/`version`"
-      else
-        p.pkg
-    else if p.version == "latest" then
-      throw "obsidian.plugins.${name}: omit `version` to follow the latest release"
-    else
-      let
-        entry = lockEntry name p;
-      in
-      if entry == null then
-        null
-      else
-        mkPlugin {
-          id = name;
-          inherit (entry) repo version assets;
-        };
-
-  # id -> store path, or null while awaiting `obsidian:sync`. Interpolating the
-  # derivations attaches their builds to the JSON's string context, so building
-  # the task graph also builds every plugin.
-  resolved = lib.mapAttrs (
-    name: p:
-    let
-      path = pluginPath name p;
-    in
-    if path == null then null else "${path}"
-  ) cfg.plugins;
-
-  pluginsJson = pkgs.writeText "obsidian-plugins.json" (builtins.toJSON resolved);
-
-  # ids listed in community-plugins.json
-  enabledJson = pkgs.writeText "obsidian-enabled-plugins.json" (
-    builtins.toJSON (lib.attrNames (lib.filterAttrs (_: p: p.enable) cfg.plugins))
-  );
-
-  # Every non-`pkg` plugin is a sync candidate. Entries already pinned in the
-  # lock are skipped, so `repo`/`version` here may be null: that tells sync to
-  # resolve them from the registry / the latest release.
-  declarations = lib.mapAttrs (name: p: { inherit (p) repo version; }) (
-    lib.filterAttrs (_: p: p.pkg == null) cfg.plugins
-  );
-  declarationsJson = pkgs.writeText "obsidian-declarations.json" (builtins.toJSON declarations);
-
-  vaultRoot = "${config.devenv.root}/${cfg.vault}";
-
-  registryArg = if cfg.registryFile == null then "" else toString cfg.registryFile;
-
-  # `obsidian:sync` and `obsidian:update` differ only in the extra flag.
-  syncExec =
-    extraArgs:
-    ''
-      ${lib.getExe cli} sync \
-        --declarations ${lib.escapeShellArg (toString declarationsJson)} \
-        --lock ${lib.escapeShellArg lockPath} \
-        --registry ${lib.escapeShellArg registryArg} \
-        ${extraArgs}
-    '';
-
-  linkExec = ''
-    ${lib.getExe cli} link \
-      --plugins ${lib.escapeShellArg (toString pluginsJson)} \
-      --enabled ${lib.escapeShellArg (toString enabledJson)} \
-      --vault ${lib.escapeShellArg vaultRoot} \
-      --config-dir ${lib.escapeShellArg cfg.configDir}
+  enterShell = ''
+    echo "obsidian.nix — module: nix/modules/obsidian.nix, CLI: cli/"
   '';
 
-  # The lock is a cache, not a prerequisite: a declaration it cannot satisfy
-  # means this evaluation has no store path for that plugin. Rather than install
-  # a partial vault, resolve the lock before the shell is entered and re-enter so
-  # the module is evaluated again against the fresh lock — `devenv shell` alone
-  # converges, with no manual sync step. Once every declaration is pinned,
-  # `obsidian:update` is the only way to move a release.
-  lockIncomplete = lib.any (path: path == null) (lib.attrValues resolved);
-in
-{
-  options.obsidian = {
-    enable = lib.mkEnableOption "declarative Obsidian plugin management";
-
-    vault = lib.mkOption {
-      type = lib.types.str;
-      default = ".";
-      description = "Vault root, relative to the devenv root.";
-    };
-
-    configDir = lib.mkOption {
-      type = lib.types.str;
-      default = ".obsidian";
-      description = "Obsidian configuration folder inside the vault.";
-    };
-
-    lockFile = lib.mkOption {
-      type = lib.types.str;
-      default = "obsidian-plugins.lock.json";
-      description = ''
-        Lock file (relative to the devenv root) holding resolved repo, version
-        and release-asset hashes, generated by `devenv tasks run obsidian:sync`.
-      '';
-    };
-
-    registryFile = lib.mkOption {
-      type = lib.types.nullOr (lib.types.either lib.types.path lib.types.str);
-      default = null;
-      description = ''
-        Path to a `community-plugins.json` snapshot used to map plugin ids to
-        GitHub repos. When null, `obsidian:sync` fetches Obsidian's registry.
-        Set it (e.g. to a flake input) to pin resolution for offline or audited
-        syncs.
-      '';
-    };
-
-    plugins = lib.mkOption {
-      type = lib.types.attrsOf (
-        lib.types.submodule (
-          { ... }:
-          {
-            options = {
-              enable = lib.mkOption {
-                type = lib.types.bool;
-                default = true;
-                description = "Whether the plugin is listed in community-plugins.json.";
-              };
-              pkg = lib.mkOption {
-                type = lib.types.nullOr lib.types.package;
-                default = null;
-                description = "Prebuilt plugin derivation (mutually exclusive with repo/version).";
-              };
-              repo = lib.mkOption {
-                type = lib.types.nullOr lib.types.str;
-                default = null;
-                description = ''
-                  "owner/name" on GitHub. Defaults to the community registry's
-                  entry for this plugin id.
-                '';
-              };
-              version = lib.mkOption {
-                type = lib.types.nullOr lib.types.str;
-                default = null;
-                description = ''
-                  Release tag to fetch. Defaults to the repo's latest release,
-                  pinned into the lock file on first sync.
-                '';
-              };
-            };
-          }
-        )
-      );
-      default = { };
-      description = "Obsidian community plugins to install, keyed by plugin id.";
-    };
-  };
-
-  config = lib.mkIf cfg.enable {
-    # devenv's `files` cannot be used here: the file list of a `pkg`
-    # derivation is unknown at eval time, so the CLI enumerates the store
-    # directory at runtime. See docs/research/declarative-obsidian-plugins.md.
-    tasks."obsidian:link" = {
-      description = "Install declared Obsidian plugins into the vault";
-      before = [ "devenv:enterShell" ];
-      # The plugin store paths are computed at evaluation time, so a lock written
-      # by the sync below is invisible to this evaluation. Re-run the task in a
-      # fresh one: the second pass sees a complete lock and takes the link path.
-      exec =
-        if lockIncomplete then
-          ''
-            ${syncExec ""}
-            exec devenv tasks run obsidian:link
-          ''
-        else
-          linkExec;
-    };
-
-    tasks."obsidian:sync" = {
-      description = "Resolve plugin releases and hashes into ${cfg.lockFile}";
-      exec = syncExec "";
-    };
-
-    tasks."obsidian:update" = {
-      description = "Re-resolve every plugin to its latest release";
-      exec = syncExec "--update";
-    };
-  };
+  enterTest = ''
+    ( cd cli && go test ./... )
+  '';
 }
