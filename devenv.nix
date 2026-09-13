@@ -86,17 +86,31 @@ let
   registryArg = if cfg.registryFile == null then "" else toString cfg.registryFile;
 
   # `obsidian:sync` and `obsidian:update` differ only in the extra flag.
-  mkSyncTask =
+  syncExec =
     extraArgs:
-    {
-      exec = ''
-        ${lib.getExe cli} sync \
-          --declarations ${lib.escapeShellArg (toString declarationsJson)} \
-          --lock ${lib.escapeShellArg lockPath} \
-          --registry ${lib.escapeShellArg registryArg} \
-          ${extraArgs}
-      '';
-    };
+    ''
+      ${lib.getExe cli} sync \
+        --declarations ${lib.escapeShellArg (toString declarationsJson)} \
+        --lock ${lib.escapeShellArg lockPath} \
+        --registry ${lib.escapeShellArg registryArg} \
+        ${extraArgs}
+    '';
+
+  linkExec = ''
+    ${lib.getExe cli} link \
+      --plugins ${lib.escapeShellArg (toString pluginsJson)} \
+      --enabled ${lib.escapeShellArg (toString enabledJson)} \
+      --vault ${lib.escapeShellArg vaultRoot} \
+      --config-dir ${lib.escapeShellArg cfg.configDir}
+  '';
+
+  # The lock is a cache, not a prerequisite: a declaration it cannot satisfy
+  # means this evaluation has no store path for that plugin. Rather than install
+  # a partial vault, resolve the lock before the shell is entered and re-enter so
+  # the module is evaluated again against the fresh lock — `devenv shell` alone
+  # converges, with no manual sync step. Once every declaration is pinned,
+  # `obsidian:update` is the only way to move a release.
+  lockIncomplete = lib.any (path: path == null) (lib.attrValues resolved);
 in
 {
   options.obsidian = {
@@ -182,21 +196,27 @@ in
     tasks."obsidian:link" = {
       description = "Install declared Obsidian plugins into the vault";
       before = [ "devenv:enterShell" ];
-      exec = ''
-        ${lib.getExe cli} link \
-          --plugins ${lib.escapeShellArg (toString pluginsJson)} \
-          --enabled ${lib.escapeShellArg (toString enabledJson)} \
-          --vault ${lib.escapeShellArg vaultRoot} \
-          --config-dir ${lib.escapeShellArg cfg.configDir}
-      '';
+      # The plugin store paths are computed at evaluation time, so a lock written
+      # by the sync below is invisible to this evaluation. Re-run the task in a
+      # fresh one: the second pass sees a complete lock and takes the link path.
+      exec =
+        if lockIncomplete then
+          ''
+            ${syncExec ""}
+            exec devenv tasks run obsidian:link
+          ''
+        else
+          linkExec;
     };
 
-    tasks."obsidian:sync" = mkSyncTask "" // {
+    tasks."obsidian:sync" = {
       description = "Resolve plugin releases and hashes into ${cfg.lockFile}";
+      exec = syncExec "";
     };
 
-    tasks."obsidian:update" = mkSyncTask "--update" // {
+    tasks."obsidian:update" = {
       description = "Re-resolve every plugin to its latest release";
+      exec = syncExec "--update";
     };
   };
 }

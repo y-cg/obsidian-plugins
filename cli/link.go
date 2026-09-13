@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -50,6 +51,14 @@ func runLink(opts *linkOptions) error {
 	var enabled []string
 	if err := readJSON(opts.enabled, &enabled); err != nil {
 		return fmt.Errorf("reading enabled plugins: %w", err)
+	}
+
+	// Refuse to touch the vault while any declaration is unresolved: a vault
+	// that lists plugins it does not have is worse than a loud failure.
+	if missing := unresolved(plugins); len(missing) > 0 {
+		return fmt.Errorf(
+			"no resolved release for %s — the lock file is incomplete, run 'devenv tasks run obsidian:sync'",
+			strings.Join(missing, ", "))
 	}
 
 	pluginsDir := filepath.Join(opts.vault, opts.configDir, "plugins")
@@ -139,8 +148,9 @@ func belongsTo(target string, dirs []string) bool {
 func install(pluginsDir string, plugins map[string]*string) error {
 	for id, src := range plugins {
 		if src == nil {
-			warnf("%s has no lock entry — run 'devenv tasks run obsidian:sync'", id)
-			continue
+			// runLink rejects unresolved declarations before touching the vault,
+			// so this guards future callers rather than a reachable path.
+			return fmt.Errorf("%s has no lock entry", id)
 		}
 
 		dir := filepath.Join(pluginsDir, id)
@@ -169,8 +179,26 @@ func install(pluginsDir string, plugins map[string]*string) error {
 	return nil
 }
 
-// replaceSymlink points path at target, replacing an existing symlink.
+// unresolved lists declared plugin ids whose release the lock does not pin.
+func unresolved(plugins map[string]*string) []string {
+	var missing []string
+	for id, src := range plugins {
+		if src == nil {
+			missing = append(missing, id)
+		}
+	}
+	sort.Strings(missing)
+	return missing
+}
+
+// replaceSymlink points path at target, leaving an already-correct symlink
+// alone so repeated runs are true no-ops. Anything else — a stale symlink, or a
+// real file Obsidian wrote — is replaced: the Nix configuration is the single
+// source of truth, so external edits are undone on the next link.
 func replaceSymlink(target, path string) error {
+	if current, err := os.Readlink(path); err == nil && current == target {
+		return nil
+	}
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 		return err
 	}

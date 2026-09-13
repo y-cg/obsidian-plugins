@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 )
 
@@ -133,6 +134,100 @@ func TestInstallLinksFilesAndSkipsRealOnes(t *testing.T) {
 	}
 	if string(got) != "handwritten" {
 		t.Errorf("real file was overwritten: %q", got)
+	}
+}
+
+func TestUnresolved(t *testing.T) {
+	got := unresolved(map[string]*string{"a": strptr("/nix/store/aaa"), "b": nil, "c": nil})
+	if want := []string{"b", "c"}; !slices.Equal(got, want) {
+		t.Errorf("unresolved() = %v, want %v", got, want)
+	}
+	if got := unresolved(map[string]*string{"a": strptr("/nix/store/aaa")}); len(got) != 0 {
+		t.Errorf("unresolved() = %v, want empty", got)
+	}
+}
+
+func TestRunLinkRejectsUnresolvedWithoutTouchingVault(t *testing.T) {
+	root := t.TempDir()
+	vault := filepath.Join(root, "vault")
+	if err := os.MkdirAll(vault, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	plugins := filepath.Join(root, "plugins.json")
+	enabled := filepath.Join(root, "enabled.json")
+	if err := os.WriteFile(plugins, []byte(`{"dataview":null}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(enabled, []byte(`["dataview"]`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	err := runLink(&linkOptions{
+		plugins:   plugins,
+		enabled:   enabled,
+		vault:     vault,
+		configDir: ".obsidian",
+	})
+	if err == nil {
+		t.Fatal("runLink accepted an unresolved declaration, want error")
+	}
+	if _, err := os.Lstat(filepath.Join(vault, ".obsidian")); !os.IsNotExist(err) {
+		t.Error("runLink created .obsidian despite the incomplete lock")
+	}
+}
+
+func TestInstallRejectsUnresolved(t *testing.T) {
+	if err := install(filepath.Join(t.TempDir(), "plugins"), map[string]*string{"p": nil}); err == nil {
+		t.Fatal("install accepted an unresolved plugin, want error")
+	}
+}
+
+func TestReplaceSymlinkIsNoOpWhenCorrect(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target")
+	if err := os.WriteFile(target, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "link")
+	if err := replaceSymlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Lstat(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := replaceSymlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.Lstat(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(before, after) {
+		t.Error("replaceSymlink recreated an already-correct symlink")
+	}
+}
+
+func TestReplaceSymlinkRevertsExternalWrite(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target")
+	if err := os.WriteFile(target, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Obsidian replaced the symlink with a real file of its own.
+	link := filepath.Join(dir, "community-plugins.json")
+	if err := os.WriteFile(link, []byte(`["other"]`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := replaceSymlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.Readlink(link)
+	if err != nil {
+		t.Fatalf("expected a symlink after replaceSymlink: %v", err)
+	}
+	if got != target {
+		t.Errorf("symlink target = %q, want %q", got, target)
 	}
 }
 
